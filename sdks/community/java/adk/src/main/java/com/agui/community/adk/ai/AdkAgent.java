@@ -41,6 +41,9 @@ import org.reactivestreams.FlowAdapters;
  *
  * <pre>
  * RUN_STARTED
+ *   REASONING_START                     (when a thinking model reasons)
+ *     REASONING_MESSAGE_*
+ *   REASONING_END
  *   TEXT_MESSAGE_START                  (when the agent produces text)
  *     TEXT_MESSAGE_CONTENT*             (streamed as partial deltas)
  *   TEXT_MESSAGE_END
@@ -53,7 +56,9 @@ import org.reactivestreams.FlowAdapters;
  *
  * <p>The ADK agent's (backend) tools are run by ADK itself; their calls and results
  * are surfaced as {@code TOOL_CALL_*} / {@code TOOL_CALL_RESULT} events so the front
- * end can display them. See {@link AdkEventTranslator}.
+ * end can display them. A thinking model's chain of thought (ADK
+ * {@link com.google.genai.types.Part#thought() thought} parts) becomes a reasoning
+ * message distinct from the assistant text. See {@link AdkEventTranslator}.
  *
  * <p><strong>Human-in-the-loop.</strong> An ADK
  * {@link com.google.adk.tools.LongRunningFunctionTool} does not resolve within the
@@ -71,10 +76,10 @@ import org.reactivestreams.FlowAdapters;
  * run streams with {@code StreamingMode.SSE} by default so text arrives as deltas.
  *
  * <p>See <a href="https://google.github.io/adk-docs/get-started/streaming/quickstart-streaming-java/">ADK
- * streaming (Java)</a>. Only text is mapped; function calls and other non-text parts
- * are ignored. If the ADK stream fails (or an ADK event reports an error), a terminal
- * {@link RunErrorEvent} is emitted instead of propagating the failure, matching the
- * protocol's in-band error handling.
+ * streaming (Java)</a>. Text, reasoning (thought) and function calls/responses are
+ * mapped; other part kinds are ignored. If the ADK stream fails (or an ADK event
+ * reports an error), a terminal {@link RunErrorEvent} is emitted instead of
+ * propagating the failure, matching the protocol's in-band error handling.
  */
 public final class AdkAgent implements Agent {
 

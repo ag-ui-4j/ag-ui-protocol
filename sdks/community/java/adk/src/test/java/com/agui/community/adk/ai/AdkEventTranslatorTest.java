@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.agui.community.core.event.Event;
 import com.agui.community.core.event.EventType;
+import com.agui.community.core.event.ReasoningMessageContentEvent;
+import com.agui.community.core.event.ReasoningMessageStartEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
 import com.agui.community.core.event.TextMessageStartEvent;
 import com.agui.community.core.event.ToolCallArgsEvent;
@@ -169,6 +171,71 @@ class AdkEventTranslatorTest {
     }
 
     @Test
+    void streamsReasoningAsItsOwnMessageAheadOfTheText() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        List<Event> events = new ArrayList<>();
+        events.addAll(translator.onEvent(thought("Plan", true)));
+        events.addAll(translator.onEvent(thought("ning", true)));
+        events.addAll(translator.onEvent(partial("Ans")));
+        events.addAll(translator.onEvent(partial("wer")));
+        // ADK repeats the whole turn (thought + text) as a final, non-partial event.
+        events.addAll(translator.onEvent(both("Planning", "Answer")));
+        events.addAll(translator.finish());
+
+        assertEquals(
+                List.of(
+                        EventType.REASONING_START,
+                        EventType.REASONING_MESSAGE_START,
+                        EventType.REASONING_MESSAGE_CONTENT,
+                        EventType.REASONING_MESSAGE_CONTENT,
+                        EventType.REASONING_MESSAGE_END,
+                        EventType.REASONING_END,
+                        EventType.TEXT_MESSAGE_START,
+                        EventType.TEXT_MESSAGE_CONTENT,
+                        EventType.TEXT_MESSAGE_CONTENT,
+                        EventType.TEXT_MESSAGE_END),
+                events.stream().map(Event::type).toList());
+
+        String reasoning = events.stream()
+                .filter(e -> e instanceof ReasoningMessageContentEvent)
+                .map(e -> ((ReasoningMessageContentEvent) e).delta())
+                .collect(Collectors.joining());
+        assertEquals("Planning", reasoning);
+        String text = events.stream()
+                .filter(e -> e instanceof TextMessageContentEvent)
+                .map(e -> ((TextMessageContentEvent) e).delta())
+                .collect(Collectors.joining());
+        assertEquals("Answer", text);
+
+        // Reasoning and text are separate messages: distinct, non-colliding ids.
+        String reasoningId = ((ReasoningMessageStartEvent) events.get(1)).messageId();
+        String textId = ((TextMessageStartEvent) events.get(6)).messageId();
+        assertEquals("msg-1-reasoning", reasoningId);
+        assertEquals("msg-1", textId);
+    }
+
+    @Test
+    void emitsReasoningOnceWhenNotStreaming() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        List<Event> events = new ArrayList<>();
+        events.addAll(translator.onEvent(thought("I should greet them", false)));
+        events.addAll(translator.finish());
+
+        assertEquals(
+                List.of(
+                        EventType.REASONING_START,
+                        EventType.REASONING_MESSAGE_START,
+                        EventType.REASONING_MESSAGE_CONTENT,
+                        EventType.REASONING_MESSAGE_END,
+                        EventType.REASONING_END),
+                events.stream().map(Event::type).toList());
+        ReasoningMessageContentEvent content = (ReasoningMessageContentEvent) events.get(2);
+        assertEquals("I should greet them", content.delta());
+    }
+
+    @Test
     void recordsLongRunningToolCallsAsInterrupts() {
         AdkEventTranslator translator = new AdkEventTranslator("msg-1");
 
@@ -238,6 +305,32 @@ class AdkEventTranslatorTest {
                 .author("model")
                 .content(Content.builder().role("model").parts(List.of(Part.fromText(text))).build())
                 .partial(partial)
+                .build();
+    }
+
+    /** A thinking model marks a chain-of-thought part with {@code thought=true}. */
+    private static com.google.adk.events.Event thought(String text, boolean partial) {
+        return com.google.adk.events.Event.builder()
+                .author("model")
+                .content(Content.builder()
+                        .role("model")
+                        .parts(List.of(Part.builder().text(text).thought(true).build()))
+                        .build())
+                .partial(partial)
+                .build();
+    }
+
+    /** The final aggregate event ADK emits: the whole turn's thought and text repeated. */
+    private static com.google.adk.events.Event both(String thoughtText, String text) {
+        return com.google.adk.events.Event.builder()
+                .author("model")
+                .content(Content.builder()
+                        .role("model")
+                        .parts(List.of(
+                                Part.builder().text(thoughtText).thought(true).build(),
+                                Part.fromText(text)))
+                        .build())
+                .partial(false)
                 .build();
     }
 }

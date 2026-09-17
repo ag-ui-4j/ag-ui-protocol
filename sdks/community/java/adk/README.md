@@ -23,6 +23,11 @@ A run maps ADK's streamed events to the AG-UI lifecycle:
 
 ```
 RUN_STARTED
+  REASONING_START                     (when a thinking model reasons)
+    REASONING_MESSAGE_START
+      REASONING_MESSAGE_CONTENT*      (streamed as partial deltas)
+    REASONING_MESSAGE_END
+  REASONING_END
   TEXT_MESSAGE_START                  (when the agent produces text)
     TEXT_MESSAGE_CONTENT*             (streamed as partial deltas)
   TEXT_MESSAGE_END
@@ -39,6 +44,19 @@ event that repeats the whole text. Partial chunks are emitted as
 `TEXT_MESSAGE_CONTENT` deltas and the trailing aggregate is dropped, so text is not
 duplicated; when ADK is not streaming, the single complete event's text is emitted
 once. The run uses `RunConfig`'s `StreamingMode.SSE` by default.
+
+**Reasoning.** A thinking model (for example the Gemini thinking models) emits its
+chain of thought as content parts flagged
+[`thought`](https://ai.google.dev/gemini-api/docs/thinking). Their text is mapped to
+the AG-UI reasoning sub-stream — `REASONING_START`, `REASONING_MESSAGE_START` /
+`REASONING_MESSAGE_CONTENT*` / `REASONING_MESSAGE_END`, `REASONING_END` — as a single
+reasoning message per turn, deduplicated against the trailing aggregate the same way
+text is. The reasoning message carries an id distinct from the assistant text
+(`<messageId>-reasoning`) so a client keeps the thinking and the answer as separate
+messages rather than merging them. Switching between reasoning, text and tool calls
+closes whichever message is open first. (Thinking is off unless the ADK agent enables
+it — e.g. via a thinking config on the model.) The encrypted `thoughtSignature` some
+models attach to a thought is not currently forwarded.
 
 **Tool calling.** An ADK agent runs its own (backend) tools — the ones registered on
 the agent, e.g. `LlmAgent.builder().tools(...)`. When the model calls one, its

@@ -1,6 +1,11 @@
 package com.agui.community.adk.ai;
 
 import com.agui.community.core.event.Event;
+import com.agui.community.core.event.ReasoningEndEvent;
+import com.agui.community.core.event.ReasoningMessageContentEvent;
+import com.agui.community.core.event.ReasoningMessageEndEvent;
+import com.agui.community.core.event.ReasoningMessageStartEvent;
+import com.agui.community.core.event.ReasoningStartEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
 import com.agui.community.core.event.TextMessageEndEvent;
 import com.agui.community.core.event.TextMessageStartEvent;
@@ -25,9 +30,11 @@ import java.util.Set;
  * thread-safe: one instance handles one run, and its methods are invoked
  * sequentially as ADK events arrive.
  *
- * <p>Three kinds of content part are mapped:
+ * <p>Content parts are mapped by kind:
  *
  * <pre>
+ * thought text     -> REASONING_START, REASONING_MESSAGE_START, REASONING_MESSAGE_CONTENT*,
+ *                     REASONING_MESSAGE_END, REASONING_END
  * text             -> TEXT_MESSAGE_START, TEXT_MESSAGE_CONTENT*, TEXT_MESSAGE_END
  * functionCall     -> TOOL_CALL_START, TOOL_CALL_ARGS, TOOL_CALL_END
  * functionResponse -> TOOL_CALL_RESULT
@@ -38,6 +45,13 @@ import java.util.Set;
  * repeats the whole text. Partial chunks become {@code TEXT_MESSAGE_CONTENT} deltas
  * and the trailing aggregate is dropped so the text is not duplicated; a
  * non-streaming turn emits its single complete text once.
+ *
+ * <p><strong>Reasoning.</strong> A thinking model emits its chain of thought as
+ * parts flagged {@link com.google.genai.types.Part#thought() thought}. Their text is
+ * mapped to the AG-UI reasoning sub-stream (a single reasoning message per turn, with
+ * an id distinct from the assistant text so a client keeps them as separate messages)
+ * and is deduplicated against the trailing aggregate the same way text is. Switching
+ * between reasoning, text and tool calls closes whichever message is open first.
  *
  * <p><strong>Tools.</strong> When the ADK agent calls one of its (backend) tools,
  * the model's {@code functionCall} is surfaced as {@code TOOL_CALL_START/ARGS/END}
@@ -60,6 +74,10 @@ import java.util.Set;
 final class AdkEventTranslator {
 
     private final String messageId;
+    // Reasoning is a separate AG-UI message from the assistant text, so it needs its
+    // own id: a client keys messages by their id, and reusing the assistant id would
+    // fold the reasoning into the answer (or drop one of them).
+    private final String reasoningMessageId;
 
     // The currently-open assistant text message id, or null when none is open. Each
     // text segment gets its own id (the base id for the first, suffixed after that)
@@ -69,6 +87,15 @@ final class AdkEventTranslator {
     // Whether a partial (streaming) delta was emitted for the open text segment. Once
     // true, the trailing aggregated (non-partial) event for that segment is dropped.
     private boolean streamedPartial;
+
+    // Whether the reasoning phase / message is currently open (the reasoning message
+    // may open and close more than once in a turn as the model interleaves thinking
+    // with text or tool calls; it always reuses reasoningMessageId).
+    private boolean reasoningPhaseOpen;
+    private boolean reasoningMessageOpen;
+    // Whether a partial reasoning delta was emitted this turn. Once true the trailing
+    // aggregated (non-partial) thought is dropped so the reasoning is not duplicated.
+    private boolean reasoningStreamed;
 
     private int toolSeq;
     private int resultSeq;
@@ -82,6 +109,7 @@ final class AdkEventTranslator {
 
     AdkEventTranslator(String messageId) {
         this.messageId = messageId;
+        this.reasoningMessageId = messageId + "-reasoning";
     }
 
     /**
@@ -102,12 +130,18 @@ final class AdkEventTranslator {
         Set<String> longRunning = event.longRunningToolIds().orElse(Set.of());
         for (Part part : parts) {
             String text = part.text().orElse("");
-            if (!text.isEmpty()) {
+            boolean thought = part.thought().orElse(false);
+            if (!text.isEmpty() && thought) {
+                emitReasoning(text, partial, out);
+            } else if (!text.isEmpty()) {
+                closeReasoning(out);
                 emitText(text, partial, out);
             } else if (part.functionCall().isPresent()) {
+                closeReasoning(out);
                 closeText(out);
                 emitFunctionCall(part.functionCall().get(), longRunning, out);
             } else if (part.functionResponse().isPresent()) {
+                closeReasoning(out);
                 closeText(out);
                 emitFunctionResponse(part.functionResponse().get(), out);
             }
@@ -134,6 +168,7 @@ final class AdkEventTranslator {
      */
     List<Event> finish() {
         List<Event> out = new ArrayList<>();
+        closeReasoning(out);
         closeText(out);
         return out;
     }
@@ -149,6 +184,42 @@ final class AdkEventTranslator {
             out.add(new TextMessageContentEvent(textId, text));
         }
         // Otherwise this is the trailing aggregate of an already-streamed segment: drop it.
+    }
+
+    private void emitReasoning(String text, boolean partial, List<Event> out) {
+        if (partial) {
+            enterReasoning(out);
+            out.add(new ReasoningMessageContentEvent(reasoningMessageId, text));
+            reasoningStreamed = true;
+        } else if (!reasoningStreamed) {
+            // Non-streaming: no partial deltas preceded this, so emit the full thought once.
+            enterReasoning(out);
+            out.add(new ReasoningMessageContentEvent(reasoningMessageId, text));
+        }
+        // Otherwise this is the trailing aggregate of already-streamed reasoning: drop it.
+    }
+
+    private void enterReasoning(List<Event> out) {
+        closeText(out);
+        if (!reasoningPhaseOpen) {
+            out.add(new ReasoningStartEvent(reasoningMessageId));
+            reasoningPhaseOpen = true;
+        }
+        if (!reasoningMessageOpen) {
+            out.add(new ReasoningMessageStartEvent(reasoningMessageId));
+            reasoningMessageOpen = true;
+        }
+    }
+
+    private void closeReasoning(List<Event> out) {
+        if (reasoningMessageOpen) {
+            out.add(new ReasoningMessageEndEvent(reasoningMessageId));
+            reasoningMessageOpen = false;
+        }
+        if (reasoningPhaseOpen) {
+            out.add(new ReasoningEndEvent(reasoningMessageId));
+            reasoningPhaseOpen = false;
+        }
     }
 
     private void openText(List<Event> out) {

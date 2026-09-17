@@ -17,6 +17,7 @@ supports) can drive an AG-UI front end.
 |------|---------|
 | [`AdkAgent`](src/main/java/com/agui/community/adk/ai/AdkAgent.java) | Wraps an ADK agent (via an ADK `Runner`). Sends the latest user message, streams the run's ADK events and emits the AG-UI event lifecycle (text, reasoning, tool calls, state, history). Pauses on long-running tool calls and resumes them from `RunAgentInput.resume()`. |
 | [`AdkHistory`](src/main/java/com/agui/community/adk/ai/AdkHistory.java) | Reconstructs the AG-UI message history from an ADK session's stored events for the `MESSAGES_SNAPSHOT`. |
+| [`AdkMessages`](src/main/java/com/agui/community/adk/ai/AdkMessages.java) | Maps AG-UI input messages to ADK inputs: the latest user message as the turn, and prior messages as events that seed a new session. |
 
 ## Event mapping
 
@@ -109,8 +110,14 @@ protocol's in-band error handling.
 **Conversation history** lives in the ADK
 [`Session`](https://google.github.io/adk-docs/sessions/session/), keyed by the run's
 `threadId`: the session is created on the first run for a thread and reused on later
-runs, so ADK accumulates history server-side. Each run sends only the latest user
-message from `RunAgentInput.messages()`.
+runs, so ADK accumulates history server-side. Each run sends the latest user message
+from `RunAgentInput.messages()` as the new turn. On the **first** run for a thread, any
+messages before that latest user message seed the freshly-created session, so a run
+can carry prior context the client already holds — user text, assistant text, assistant
+tool calls and tool results are mapped (the inward mirror of the snapshot below).
+System and developer messages have no ADK content role (an ADK agent's instruction is
+set on the agent), and reasoning is not seeded, so those are skipped. Once a session
+exists ADK is authoritative and the client's history is not re-imported.
 
 When a thread already has history, the run begins with a `MESSAGES_SNAPSHOT`
 reconstructed from the session's stored events, so a reconnecting client recovers the
@@ -120,8 +127,8 @@ function call to an assistant message carrying its tool calls, and a function re
 to a tool message (reasoning/thought parts are omitted, matching the protocol's
 message history). ADK persists only complete events, so the snapshot is not polluted
 by streaming chunks. A brand-new thread emits no snapshot, so it never clears a
-client's optimistic messages. History is read from ADK only; a message list seeded via
-`RunAgentInput.messages()` beyond the latest user message is not imported.
+client's optimistic messages (its provided history is instead seeded into the new
+session, as described above).
 
 ## Usage
 

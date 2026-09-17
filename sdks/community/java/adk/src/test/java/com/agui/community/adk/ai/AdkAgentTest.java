@@ -207,6 +207,27 @@ class AdkAgentTest {
                 m instanceof AssistantMessage && "Hello".equals(m.content())), history.toString());
     }
 
+    @Test
+    void seedsANewSessionWithPriorHistoryFromTheMessageList() {
+        AdkAgent adkAgent = new AdkAgent(fakeAgent(Flowable.just(complete("Sure"))));
+        RunAgentInput input = new RunAgentInput("t1", "r1", List.of(
+                new UserMessage("u1", "hello"),
+                new AssistantMessage("a1", "hi there"),
+                new UserMessage("u2", "what's up")), List.of());
+
+        List<Event> events = collect(adkAgent.run(input));
+
+        // Seeding the new session put the prior turns into ADK, so they come back in the
+        // history snapshot; the latest user message is the turn input, not part of it.
+        List<Message> history = ((MessagesSnapshotEvent) events.stream()
+                .filter(e -> e.type() == EventType.MESSAGES_SNAPSHOT)
+                .findFirst()
+                .orElseThrow()).messages();
+        assertTrue(history.stream().anyMatch(m -> "hello".equals(m.content())), history.toString());
+        assertTrue(history.stream().anyMatch(m -> "hi there".equals(m.content())), history.toString());
+        assertTrue(history.stream().noneMatch(m -> "what's up".equals(m.content())), history.toString());
+    }
+
     private static com.google.adk.events.Event stateChange(Map<String, Object> delta) {
         return com.google.adk.events.Event.builder()
                 .author("model")

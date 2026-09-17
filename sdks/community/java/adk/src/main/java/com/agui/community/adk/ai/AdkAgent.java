@@ -12,7 +12,6 @@ import com.agui.community.core.interrupt.InterruptOutcome;
 import com.agui.community.core.interrupt.Resume;
 import com.agui.community.core.interrupt.ResumeStatus;
 import com.agui.community.core.message.Message;
-import com.agui.community.core.message.Role;
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.RunConfig;
 import com.google.adk.runner.InMemoryRunner;
@@ -76,8 +75,11 @@ import org.reactivestreams.FlowAdapters;
  * <p>Conversation state lives in the ADK {@link com.google.adk.sessions.Session},
  * keyed by the run's {@code threadId}: the session is created on the first run for a
  * thread and reused on later runs, so ADK accumulates the history server-side. Each
- * run sends only the latest user message from {@link RunAgentInput#messages()}. The
- * run streams with {@code StreamingMode.SSE} by default so text arrives as deltas.
+ * run sends the latest user message from {@link RunAgentInput#messages()}; on the
+ * first run for a thread, any earlier messages seed the new session so the run carries
+ * that prior context (see {@link AdkMessages}). Once a session exists ADK is
+ * authoritative and the client's history is not re-imported. The run streams with
+ * {@code StreamingMode.SSE} by default so text arrives as deltas.
  * The session's shared state is surfaced as a {@code STATE_SNAPSHOT} at the start of
  * the turn and {@code STATE_DELTA} events as ADK mutates it; see
  * {@link AdkEventTranslator}. When the thread already has history, a
@@ -222,15 +224,20 @@ public final class AdkAgent implements Agent {
         // back as function responses) or sends the latest user message. Resuming takes
         // precedence: the front end has resolved an interrupt from a prior run.
         Content turnInput = resumeContent(input.resume());
+        // Any messages before the latest user message seed a brand-new session, so a
+        // first run can carry prior context; ignored when resuming (the session exists).
+        List<com.google.adk.events.Event> seed = List.of();
         if (Objects.isNull(turnInput)) {
-            turnInput = latestUserContent(input.messages());
+            turnInput = AdkMessages.latestUserContent(input.messages());
+            seed = AdkMessages.historyBefore(input.messages());
         }
         Content input0 = turnInput;
+        List<com.google.adk.events.Event> seed0 = seed;
         AdkEventTranslator translator = new AdkEventTranslator(messageIdGenerator.get());
 
         Flowable<Event> events = Flowable.<Event>defer(() -> Flowable.concat(
                         Flowable.just(new RunStartedEvent(threadId, runId)),
-                        Objects.isNull(input0) ? Flowable.empty() : turn(threadId, input0, translator),
+                        Objects.isNull(input0) ? Flowable.empty() : turn(threadId, input0, seed0, translator),
                         Flowable.defer(() -> Flowable.just(finished(threadId, runId, translator)))))
                 .onErrorResumeNext(throwable -> Flowable.just(new RunErrorEvent(describe(throwable))));
 
@@ -238,11 +245,13 @@ public final class AdkAgent implements Agent {
     }
 
     /**
-     * Streams one model turn: resolve the thread's session, emit its history and state
-     * snapshots, run it and translate the events.
+     * Streams one model turn: resolve the thread's session (seeding it with prior
+     * history if it is new), emit its history and state snapshots, run it and translate
+     * the events.
      */
-    private Flowable<Event> turn(String threadId, Content turnInput, AdkEventTranslator translator) {
-        return session(threadId).flatMapPublisher(session -> Flowable.concat(
+    private Flowable<Event> turn(String threadId, Content turnInput,
+            List<com.google.adk.events.Event> seed, AdkEventTranslator translator) {
+        return session(threadId, seed).flatMapPublisher(session -> Flowable.concat(
                 Flowable.fromIterable(prelude(session, translator)),
                 runner.runAsync(userId, session.id(), turnInput, runConfig)
                         .concatMapIterable(translator::onEvent),
@@ -329,34 +338,30 @@ public final class AdkAgent implements Agent {
         return wrapped;
     }
 
-    /** The ADK session for a thread: reuse it if present, otherwise create it. */
-    private Single<Session> session(String threadId) {
+    /**
+     * The ADK session for a thread: reuse it if present, otherwise create it. A newly
+     * created session is seeded with the given prior-history events (an existing session
+     * is authoritative, so the seed is ignored for it).
+     */
+    private Single<Session> session(String threadId, List<com.google.adk.events.Event> seed) {
         String appName = runner.appName();
         return runner.sessionService()
                 .getSession(appName, userId, threadId, Optional.empty())
-                .switchIfEmpty(runner.sessionService()
-                        .createSession(appName, userId, new ConcurrentHashMap<>(), threadId));
+                .switchIfEmpty(createSession(appName, threadId, seed));
     }
 
-    /**
-     * Builds an ADK user {@link Content} from the most recent user message in the run
-     * input, or {@code null} if there is none (or it is blank).
-     */
-    private static Content latestUserContent(List<Message> messages) {
-        if (Objects.isNull(messages)) {
-            return null;
+    /** Creates the session and appends the seed events (if any) in order before returning it. */
+    private Single<Session> createSession(String appName, String threadId,
+            List<com.google.adk.events.Event> seed) {
+        Single<Session> created = runner.sessionService()
+                .createSession(appName, userId, new ConcurrentHashMap<>(), threadId);
+        if (Objects.isNull(seed) || seed.isEmpty()) {
+            return created;
         }
-        for (int i = messages.size() - 1; i >= 0; i--) {
-            Message message = messages.get(i);
-            if (message.role() == Role.USER) {
-                String text = message.content();
-                if (Objects.nonNull(text) && !text.isEmpty()) {
-                    return Content.builder().role("user").parts(List.of(Part.fromText(text))).build();
-                }
-                return null;
-            }
-        }
-        return null;
+        return created.flatMap(session -> Flowable.fromIterable(seed)
+                .concatMapSingle(event -> runner.sessionService().appendEvent(session, event))
+                .ignoreElements()
+                .andThen(Single.just(session)));
     }
 
     private static String describe(Throwable throwable) {

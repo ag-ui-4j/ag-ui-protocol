@@ -41,6 +41,8 @@ import org.reactivestreams.FlowAdapters;
  *
  * <pre>
  * RUN_STARTED
+ *   STATE_SNAPSHOT                      (the session's state as the turn begins)
+ *   STATE_DELTA                         (per ADK event that changes session state)
  *   REASONING_START                     (when a thinking model reasons)
  *     REASONING_MESSAGE_*
  *   REASONING_END
@@ -74,10 +76,14 @@ import org.reactivestreams.FlowAdapters;
  * thread and reused on later runs, so ADK accumulates the history server-side. Each
  * run sends only the latest user message from {@link RunAgentInput#messages()}. The
  * run streams with {@code StreamingMode.SSE} by default so text arrives as deltas.
+ * The session's shared state is surfaced as a {@code STATE_SNAPSHOT} at the start of
+ * the turn and {@code STATE_DELTA} events as ADK mutates it; see
+ * {@link AdkEventTranslator}.
  *
  * <p>See <a href="https://google.github.io/adk-docs/get-started/streaming/quickstart-streaming-java/">ADK
- * streaming (Java)</a>. Text, reasoning (thought) and function calls/responses are
- * mapped; other part kinds are ignored. If the ADK stream fails (or an ADK event
+ * streaming (Java)</a>. Text, reasoning (thought), function calls/responses and
+ * session-state changes are mapped; other part kinds are ignored. If the ADK stream
+ * fails (or an ADK event
  * reports an error), a terminal {@link RunErrorEvent} is emitted instead of
  * propagating the failure, matching the protocol's in-band error handling.
  */
@@ -227,12 +233,16 @@ public final class AdkAgent implements Agent {
         return FlowAdapters.toFlowPublisher(events);
     }
 
-    /** Streams one model turn: resolve the thread's session, run it, translate the events. */
+    /**
+     * Streams one model turn: resolve the thread's session, emit its state snapshot,
+     * run it and translate the events.
+     */
     private Flowable<Event> turn(String threadId, Content turnInput, AdkEventTranslator translator) {
-        return session(threadId)
-                .flatMapPublisher(session -> runner.runAsync(userId, session.id(), turnInput, runConfig))
-                .concatMapIterable(translator::onEvent)
-                .concatWith(Flowable.defer(() -> Flowable.fromIterable(translator.finish())));
+        return session(threadId).flatMapPublisher(session -> Flowable.concat(
+                Flowable.fromIterable(translator.snapshot(session.state())),
+                runner.runAsync(userId, session.id(), turnInput, runConfig)
+                        .concatMapIterable(translator::onEvent),
+                Flowable.defer(() -> Flowable.fromIterable(translator.finish()))));
     }
 
     /**

@@ -19,6 +19,7 @@ import com.agui.community.core.interrupt.ResumeStatus;
 import com.agui.community.core.message.UserMessage;
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
+import com.google.adk.events.EventActions;
 import com.google.genai.types.Content;
 import com.google.genai.types.FunctionCall;
 import com.google.genai.types.FunctionResponse;
@@ -157,6 +158,31 @@ class AdkAgentTest {
         assertTrue(text.contains("confirmed"), text);
         RunFinishedEvent finished = (RunFinishedEvent) events.get(events.size() - 1);
         assertNull(finished.outcome());
+    }
+
+    @Test
+    void emitsStateSnapshotAtRunStartAndDeltaWhenStateChanges() {
+        BaseAgent agent = fakeAgent(Flowable.just(
+                stateChange(Map.of("count", 1)),
+                complete("Counted")));
+        AdkAgent adkAgent = new AdkAgent(agent);
+        RunAgentInput input = new RunAgentInput("t1", "r1",
+                List.of(new UserMessage("m1", "count")), List.of());
+
+        List<Event> events = collect(adkAgent.run(input));
+
+        // The snapshot is the first event after RUN_STARTED, before any content.
+        assertEquals(EventType.RUN_STARTED, events.get(0).type());
+        assertEquals(EventType.STATE_SNAPSHOT, events.get(1).type());
+        assertTrue(events.stream().anyMatch(e -> e.type() == EventType.STATE_DELTA));
+        assertEquals(EventType.RUN_FINISHED, events.get(events.size() - 1).type());
+    }
+
+    private static com.google.adk.events.Event stateChange(Map<String, Object> delta) {
+        return com.google.adk.events.Event.builder()
+                .author("model")
+                .actions(EventActions.builder().stateDelta(delta).build())
+                .build();
     }
 
     private static com.google.adk.events.Event functionCall(String id, String name, Map<String, Object> args) {

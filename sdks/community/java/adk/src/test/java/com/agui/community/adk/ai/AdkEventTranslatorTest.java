@@ -6,8 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.agui.community.core.event.Event;
 import com.agui.community.core.event.EventType;
+import com.agui.community.core.event.JsonPatchOperation;
 import com.agui.community.core.event.ReasoningMessageContentEvent;
 import com.agui.community.core.event.ReasoningMessageStartEvent;
+import com.agui.community.core.event.StateDeltaEvent;
+import com.agui.community.core.event.StateSnapshotEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
 import com.agui.community.core.event.TextMessageStartEvent;
 import com.agui.community.core.event.ToolCallArgsEvent;
@@ -15,6 +18,7 @@ import com.agui.community.core.event.ToolCallResultEvent;
 import com.agui.community.core.event.ToolCallStartEvent;
 import com.agui.community.core.interrupt.Interrupt;
 import com.agui.community.core.message.Role;
+import com.google.adk.events.EventActions;
 import com.google.genai.types.Content;
 import com.google.genai.types.FunctionCall;
 import com.google.genai.types.FunctionResponse;
@@ -236,6 +240,61 @@ class AdkEventTranslatorTest {
     }
 
     @Test
+    void snapshotsTheSessionState() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        List<Event> events = translator.snapshot(Map.of("count", 1, "user:name", "Ada"));
+
+        assertEquals(1, events.size());
+        StateSnapshotEvent snapshot = (StateSnapshotEvent) events.get(0);
+        assertEquals(Map.of("count", 1, "user:name", "Ada"), snapshot.snapshot());
+    }
+
+    @Test
+    void snapshotsEmptyStateWhenTheSessionHasNone() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        StateSnapshotEvent snapshot = (StateSnapshotEvent) translator.snapshot(null).get(0);
+        assertEquals(Map.of(), snapshot.snapshot());
+    }
+
+    @Test
+    void emitsAStateDeltaWhenAnAdkEventChangesState() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        List<Event> events = translator.onEvent(stateChange(Map.of("count", 2)));
+
+        StateDeltaEvent delta = (StateDeltaEvent) events.stream()
+                .filter(e -> e.type() == EventType.STATE_DELTA)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(1, delta.delta().size());
+        JsonPatchOperation op = delta.delta().get(0);
+        assertEquals("add", op.op());
+        assertEquals("/count", op.path());
+        assertEquals(2, op.value());
+    }
+
+    @Test
+    void escapesJsonPointerCharactersInStateKeys() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        List<Event> events = translator.onEvent(stateChange(Map.of("a/b~c", true)));
+
+        StateDeltaEvent delta = (StateDeltaEvent) events.get(0);
+        assertEquals("/a~1b~0c", delta.delta().get(0).path());
+    }
+
+    @Test
+    void emitsNoStateDeltaWhenNothingChanged() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        List<Event> events = translator.onEvent(complete("Hello"));
+
+        assertTrue(events.stream().noneMatch(e -> e.type() == EventType.STATE_DELTA), events.toString());
+    }
+
+    @Test
     void recordsLongRunningToolCallsAsInterrupts() {
         AdkEventTranslator translator = new AdkEventTranslator("msg-1");
 
@@ -305,6 +364,14 @@ class AdkEventTranslatorTest {
                 .author("model")
                 .content(Content.builder().role("model").parts(List.of(Part.fromText(text))).build())
                 .partial(partial)
+                .build();
+    }
+
+    /** An ADK event that mutates session state via its actions' state delta. */
+    private static com.google.adk.events.Event stateChange(Map<String, Object> delta) {
+        return com.google.adk.events.Event.builder()
+                .author("model")
+                .actions(EventActions.builder().stateDelta(delta).build())
                 .build();
     }
 

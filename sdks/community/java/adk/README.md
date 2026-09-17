@@ -15,7 +15,7 @@ supports) can drive an AG-UI front end.
 
 | Type | Purpose |
 |------|---------|
-| [`AdkAgent`](src/main/java/com/agui/community/adk/ai/AdkAgent.java) | Wraps an ADK agent (via an ADK `Runner`). Sends the latest user message, streams the run's ADK events and emits the AG-UI event lifecycle. Pauses on long-running tool calls and resumes them from `RunAgentInput.resume()`. |
+| [`AdkAgent`](src/main/java/com/agui/community/adk/ai/AdkAgent.java) | Wraps an ADK agent (via an ADK `Runner`). Sends the latest user message, streams the run's ADK events and emits the AG-UI event lifecycle (text, reasoning, tool calls, state). Pauses on long-running tool calls and resumes them from `RunAgentInput.resume()`. |
 
 ## Event mapping
 
@@ -23,6 +23,8 @@ A run maps ADK's streamed events to the AG-UI lifecycle:
 
 ```
 RUN_STARTED
+  STATE_SNAPSHOT                      (the session's state as the turn begins)
+  STATE_DELTA                         (per ADK event that changes session state)
   REASONING_START                     (when a thinking model reasons)
     REASONING_MESSAGE_START
       REASONING_MESSAGE_CONTENT*      (streamed as partial deltas)
@@ -44,6 +46,17 @@ event that repeats the whole text. Partial chunks are emitted as
 `TEXT_MESSAGE_CONTENT` deltas and the trailing aggregate is dropped, so text is not
 duplicated; when ADK is not streaming, the single complete event's text is emitted
 once. The run uses `RunConfig`'s `StreamingMode.SSE` by default.
+
+**State.** ADK keeps shared conversation state in the
+[`Session`](https://google.github.io/adk-docs/sessions/state/). At the start of each
+turn the agent emits a `STATE_SNAPSHOT` of the session's current state, and every ADK
+event that changes state (its
+[`EventActions.stateDelta`](https://google.github.io/adk-docs/sessions/state/#how-state-is-updated-eventactions-state_delta))
+becomes a `STATE_DELTA` carrying JSON Patch (RFC 6902) `add` operations — one per
+changed key, with keys escaped per RFC 6901. The ADK session is authoritative, so the
+snapshot reflects whatever the session holds (including empty state on a new thread),
+and keys are forwarded verbatim, including any `app:` / `user:` prefixes. State flows
+outward only; seeding the session from `RunAgentInput.state()` is not wired up.
 
 **Reasoning.** A thinking model (for example the Gemini thinking models) emits its
 chain of thought as content parts flagged
@@ -91,7 +104,7 @@ If the ADK stream fails, or an ADK event reports an `errorMessage`, a terminal
 `RUN_ERROR` event is emitted instead of propagating the failure — matching the
 protocol's in-band error handling.
 
-**Conversation state** lives in the ADK
+**Conversation history** lives in the ADK
 [`Session`](https://google.github.io/adk-docs/sessions/session/), keyed by the run's
 `threadId`: the session is created on the first run for a thread and reused on later
 runs, so ADK accumulates history server-side. Each run sends only the latest user

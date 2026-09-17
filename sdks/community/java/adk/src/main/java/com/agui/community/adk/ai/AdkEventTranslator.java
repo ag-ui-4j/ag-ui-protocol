@@ -1,11 +1,14 @@
 package com.agui.community.adk.ai;
 
 import com.agui.community.core.event.Event;
+import com.agui.community.core.event.JsonPatchOperation;
 import com.agui.community.core.event.ReasoningEndEvent;
 import com.agui.community.core.event.ReasoningMessageContentEvent;
 import com.agui.community.core.event.ReasoningMessageEndEvent;
 import com.agui.community.core.event.ReasoningMessageStartEvent;
 import com.agui.community.core.event.ReasoningStartEvent;
+import com.agui.community.core.event.StateDeltaEvent;
+import com.agui.community.core.event.StateSnapshotEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
 import com.agui.community.core.event.TextMessageEndEvent;
 import com.agui.community.core.event.TextMessageStartEvent;
@@ -15,11 +18,13 @@ import com.agui.community.core.event.ToolCallResultEvent;
 import com.agui.community.core.event.ToolCallStartEvent;
 import com.agui.community.core.interrupt.Interrupt;
 import com.agui.community.core.message.Role;
+import com.google.adk.events.EventActions;
 import com.google.genai.JsonSerializable;
 import com.google.genai.types.FunctionCall;
 import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -67,6 +72,14 @@ import java.util.Set;
  * recorded as an {@link Interrupt} (bound by {@code toolCallId}) so the agent can end
  * the run with an interrupt outcome and let the front end resolve the call. See
  * {@link #interrupts()}.
+ *
+ * <p><strong>State.</strong> ADK keeps conversation state in the session. The agent
+ * emits a {@code STATE_SNAPSHOT} of the session's state when a turn begins (see
+ * {@link #snapshot(Map)}), and each ADK event that changes state
+ * ({@link com.google.adk.events.EventActions#stateDelta()}) becomes a
+ * {@code STATE_DELTA} carrying JSON Patch (RFC 6902) {@code add} operations, one per
+ * changed key. The ADK session is authoritative; state keys are forwarded verbatim
+ * (including any {@code app:}/{@code user:} prefixes).
  *
  * <p>An ADK event carrying an {@code errorMessage} aborts the run: the message is
  * thrown so the agent maps it to a terminal {@code RUN_ERROR}.
@@ -125,6 +138,7 @@ final class AdkEventTranslator {
         });
 
         List<Event> out = new ArrayList<>();
+        emitStateDelta(event, out);
         List<Part> parts = event.content().flatMap(content -> content.parts()).orElse(List.of());
         boolean partial = event.partial().orElse(false);
         Set<String> longRunning = event.longRunningToolIds().orElse(Set.of());
@@ -159,6 +173,42 @@ final class AdkEventTranslator {
      */
     List<Interrupt> interrupts() {
         return interrupts;
+    }
+
+    /**
+     * A {@code STATE_SNAPSHOT} of the ADK session's state at the start of a turn, so a
+     * client syncs to the authoritative state before the run streams. The state is
+     * copied defensively, as the session map is live and mutated during the run.
+     *
+     * @param state the session's current state (may be {@code null})
+     * @return the snapshot event, as a single-element list
+     */
+    List<Event> snapshot(Map<String, Object> state) {
+        Map<String, Object> copy = new LinkedHashMap<>();
+        if (state != null) {
+            copy.putAll(state);
+        }
+        return List.of(new StateSnapshotEvent(copy));
+    }
+
+    private void emitStateDelta(com.google.adk.events.Event event, List<Event> out) {
+        EventActions actions = event.actions();
+        Map<String, Object> delta = actions == null ? null : actions.stateDelta();
+        if (delta == null || delta.isEmpty()) {
+            return;
+        }
+        List<JsonPatchOperation> operations = new ArrayList<>();
+        for (Map.Entry<String, Object> entry : delta.entrySet()) {
+            // RFC 6902 "add" replaces the target if it already exists, so it applies to
+            // both new and updated keys without tracking prior state.
+            operations.add(new JsonPatchOperation("add", "/" + escapePointer(entry.getKey()), entry.getValue()));
+        }
+        out.add(new StateDeltaEvent(operations));
+    }
+
+    /** Escapes a state key for a JSON Pointer path segment (RFC 6901). */
+    private static String escapePointer(String key) {
+        return key.replace("~", "~0").replace("/", "~1");
     }
 
     /**

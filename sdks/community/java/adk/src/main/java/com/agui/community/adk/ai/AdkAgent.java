@@ -3,6 +3,7 @@ package com.agui.community.adk.ai;
 import com.agui.community.core.agent.Agent;
 import com.agui.community.core.agent.RunAgentInput;
 import com.agui.community.core.event.Event;
+import com.agui.community.core.event.MessagesSnapshotEvent;
 import com.agui.community.core.event.RunErrorEvent;
 import com.agui.community.core.event.RunFinishedEvent;
 import com.agui.community.core.event.RunStartedEvent;
@@ -41,6 +42,7 @@ import org.reactivestreams.FlowAdapters;
  *
  * <pre>
  * RUN_STARTED
+ *   MESSAGES_SNAPSHOT                   (the thread's prior history, if any)
  *   STATE_SNAPSHOT                      (the session's state as the turn begins)
  *   STATE_DELTA                         (per ADK event that changes session state)
  *   REASONING_START                     (when a thinking model reasons)
@@ -78,7 +80,9 @@ import org.reactivestreams.FlowAdapters;
  * run streams with {@code StreamingMode.SSE} by default so text arrives as deltas.
  * The session's shared state is surfaced as a {@code STATE_SNAPSHOT} at the start of
  * the turn and {@code STATE_DELTA} events as ADK mutates it; see
- * {@link AdkEventTranslator}.
+ * {@link AdkEventTranslator}. When the thread already has history, a
+ * {@code MESSAGES_SNAPSHOT} reconstructed from the session's stored events (see
+ * {@link AdkHistory}) precedes it, so a reconnecting client recovers the prior turns.
  *
  * <p>See <a href="https://google.github.io/adk-docs/get-started/streaming/quickstart-streaming-java/">ADK
  * streaming (Java)</a>. Text, reasoning (thought), function calls/responses and
@@ -234,15 +238,30 @@ public final class AdkAgent implements Agent {
     }
 
     /**
-     * Streams one model turn: resolve the thread's session, emit its state snapshot,
-     * run it and translate the events.
+     * Streams one model turn: resolve the thread's session, emit its history and state
+     * snapshots, run it and translate the events.
      */
     private Flowable<Event> turn(String threadId, Content turnInput, AdkEventTranslator translator) {
         return session(threadId).flatMapPublisher(session -> Flowable.concat(
-                Flowable.fromIterable(translator.snapshot(session.state())),
+                Flowable.fromIterable(prelude(session, translator)),
                 runner.runAsync(userId, session.id(), turnInput, runConfig)
                         .concatMapIterable(translator::onEvent),
                 Flowable.defer(() -> Flowable.fromIterable(translator.finish()))));
+    }
+
+    /**
+     * The snapshot events emitted before a turn streams: the conversation history the
+     * ADK session already holds (only when non-empty, so a fresh thread does not clear
+     * a client's optimistic messages), then the session's state.
+     */
+    private static List<Event> prelude(Session session, AdkEventTranslator translator) {
+        List<Event> events = new ArrayList<>();
+        List<Message> history = AdkHistory.fromEvents(session.events());
+        if (!history.isEmpty()) {
+            events.add(new MessagesSnapshotEvent(history));
+        }
+        events.addAll(translator.snapshot(session.state()));
+        return events;
     }
 
     /**

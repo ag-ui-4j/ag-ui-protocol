@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.agui.community.core.agent.RunAgentInput;
 import com.agui.community.core.event.Event;
 import com.agui.community.core.event.EventType;
+import com.agui.community.core.event.MessagesSnapshotEvent;
 import com.agui.community.core.event.RunErrorEvent;
 import com.agui.community.core.event.RunFinishedEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
@@ -16,6 +17,8 @@ import com.agui.community.core.interrupt.Interrupt;
 import com.agui.community.core.interrupt.InterruptOutcome;
 import com.agui.community.core.interrupt.Resume;
 import com.agui.community.core.interrupt.ResumeStatus;
+import com.agui.community.core.message.AssistantMessage;
+import com.agui.community.core.message.Message;
 import com.agui.community.core.message.UserMessage;
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
@@ -176,6 +179,32 @@ class AdkAgentTest {
         assertEquals(EventType.STATE_SNAPSHOT, events.get(1).type());
         assertTrue(events.stream().anyMatch(e -> e.type() == EventType.STATE_DELTA));
         assertEquals(EventType.RUN_FINISHED, events.get(events.size() - 1).type());
+    }
+
+    @Test
+    void emitsMessagesSnapshotOfPriorHistoryOnALaterRun() {
+        // One runner reused across two runs on the same thread; the fake agent's cold
+        // Flowable re-emits on each run, and the InMemory session accumulates history.
+        AdkAgent adkAgent = new AdkAgent(fakeAgent(Flowable.just(complete("Hello"))));
+
+        List<Event> first = collect(adkAgent.run(new RunAgentInput("t1", "r1",
+                List.of(new UserMessage("m1", "hi")), List.of())));
+        // A fresh thread has no history: no snapshot to avoid clearing the client.
+        assertTrue(first.stream().noneMatch(e -> e.type() == EventType.MESSAGES_SNAPSHOT));
+
+        List<Event> second = collect(adkAgent.run(new RunAgentInput("t1", "r2",
+                List.of(new UserMessage("m2", "again")), List.of())));
+
+        // The history snapshot leads the turn, before the state snapshot.
+        assertEquals(EventType.RUN_STARTED, second.get(0).type());
+        assertEquals(EventType.MESSAGES_SNAPSHOT, second.get(1).type());
+        assertEquals(EventType.STATE_SNAPSHOT, second.get(2).type());
+
+        List<Message> history = ((MessagesSnapshotEvent) second.get(1)).messages();
+        assertTrue(history.stream().anyMatch(m ->
+                m instanceof UserMessage && "hi".equals(m.content())), history.toString());
+        assertTrue(history.stream().anyMatch(m ->
+                m instanceof AssistantMessage && "Hello".equals(m.content())), history.toString());
     }
 
     private static com.google.adk.events.Event stateChange(Map<String, Object> delta) {

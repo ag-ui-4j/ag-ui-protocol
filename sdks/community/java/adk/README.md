@@ -15,7 +15,8 @@ supports) can drive an AG-UI front end.
 
 | Type | Purpose |
 |------|---------|
-| [`AdkAgent`](src/main/java/com/agui/community/adk/ai/AdkAgent.java) | Wraps an ADK agent (via an ADK `Runner`). Sends the latest user message, streams the run's ADK events and emits the AG-UI event lifecycle (text, reasoning, tool calls, state). Pauses on long-running tool calls and resumes them from `RunAgentInput.resume()`. |
+| [`AdkAgent`](src/main/java/com/agui/community/adk/ai/AdkAgent.java) | Wraps an ADK agent (via an ADK `Runner`). Sends the latest user message, streams the run's ADK events and emits the AG-UI event lifecycle (text, reasoning, tool calls, state, history). Pauses on long-running tool calls and resumes them from `RunAgentInput.resume()`. |
+| [`AdkHistory`](src/main/java/com/agui/community/adk/ai/AdkHistory.java) | Reconstructs the AG-UI message history from an ADK session's stored events for the `MESSAGES_SNAPSHOT`. |
 
 ## Event mapping
 
@@ -23,6 +24,7 @@ A run maps ADK's streamed events to the AG-UI lifecycle:
 
 ```
 RUN_STARTED
+  MESSAGES_SNAPSHOT                   (the thread's prior history, if any)
   STATE_SNAPSHOT                      (the session's state as the turn begins)
   STATE_DELTA                         (per ADK event that changes session state)
   REASONING_START                     (when a thinking model reasons)
@@ -109,6 +111,17 @@ protocol's in-band error handling.
 `threadId`: the session is created on the first run for a thread and reused on later
 runs, so ADK accumulates history server-side. Each run sends only the latest user
 message from `RunAgentInput.messages()`.
+
+When a thread already has history, the run begins with a `MESSAGES_SNAPSHOT`
+reconstructed from the session's stored events, so a reconnecting client recovers the
+prior turns before the current turn streams. Each stored ADK event maps to one
+message — user text to a user message, model text to an assistant message, a model
+function call to an assistant message carrying its tool calls, and a function response
+to a tool message (reasoning/thought parts are omitted, matching the protocol's
+message history). ADK persists only complete events, so the snapshot is not polluted
+by streaming chunks. A brand-new thread emits no snapshot, so it never clears a
+client's optimistic messages. History is read from ADK only; a message list seeded via
+`RunAgentInput.messages()` beyond the latest user message is not imported.
 
 ## Usage
 

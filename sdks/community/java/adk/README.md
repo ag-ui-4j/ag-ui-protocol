@@ -32,6 +32,7 @@ RUN_STARTED
     REASONING_MESSAGE_START
       REASONING_MESSAGE_CONTENT*      (streamed as partial deltas)
     REASONING_MESSAGE_END
+    REASONING_ENCRYPTED_VALUE?        (the model's thought signature, if any)
   REASONING_END
   TEXT_MESSAGE_START                  (when the agent produces text)
     TEXT_MESSAGE_CONTENT*             (streamed as partial deltas)
@@ -71,8 +72,16 @@ text is. The reasoning message carries an id distinct from the assistant text
 (`<messageId>-reasoning`) so a client keeps the thinking and the answer as separate
 messages rather than merging them. Switching between reasoning, text and tool calls
 closes whichever message is open first. (Thinking is off unless the ADK agent enables
-it — e.g. via a thinking config on the model.) The encrypted `thoughtSignature` some
-models attach to a thought is not currently forwarded.
+it — e.g. via a thinking config on the model.)
+
+When a thought part carries an encrypted
+[`thoughtSignature`](https://ai.google.dev/gemini-api/docs/thinking#signatures), it is
+Base64-encoded and emitted as a `REASONING_ENCRYPTED_VALUE` (subtype `message`, bound
+to the reasoning message id) as the reasoning phase closes — after
+`REASONING_MESSAGE_END`, before `REASONING_END`. A client stores it with the reasoning
+message and returns it unchanged so the model can restore its reasoning context.
+Signatures on non-thought parts are not forwarded (they have no reasoning message to
+attach to).
 
 **Tool calling.** An ADK agent runs its own (backend) tools — the ones registered on
 the agent, e.g. `LlmAgent.builder().tools(...)`. When the model calls one, its

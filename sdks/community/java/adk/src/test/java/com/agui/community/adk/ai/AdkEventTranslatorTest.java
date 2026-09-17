@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.agui.community.core.event.Event;
 import com.agui.community.core.event.EventType;
 import com.agui.community.core.event.JsonPatchOperation;
+import com.agui.community.core.event.ReasoningEncryptedValueEvent;
 import com.agui.community.core.event.ReasoningMessageContentEvent;
 import com.agui.community.core.event.ReasoningMessageStartEvent;
 import com.agui.community.core.event.StateDeltaEvent;
@@ -24,6 +25,7 @@ import com.google.genai.types.FunctionCall;
 import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -240,6 +242,50 @@ class AdkEventTranslatorTest {
     }
 
     @Test
+    void emitsAnEncryptedValueForAThoughtSignature() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+        byte[] signature = {1, 2, 3, 4};
+
+        List<Event> events = new ArrayList<>();
+        events.addAll(translator.onEvent(thoughtWithSignature("planning", true, signature)));
+        events.addAll(translator.finish());
+
+        assertEquals(
+                List.of(
+                        EventType.REASONING_START,
+                        EventType.REASONING_MESSAGE_START,
+                        EventType.REASONING_MESSAGE_CONTENT,
+                        EventType.REASONING_MESSAGE_END,
+                        EventType.REASONING_ENCRYPTED_VALUE,
+                        EventType.REASONING_END),
+                events.stream().map(Event::type).toList());
+
+        ReasoningEncryptedValueEvent encrypted = (ReasoningEncryptedValueEvent) events.get(4);
+        assertEquals("message", encrypted.subtype());
+        assertEquals("msg-1-reasoning", encrypted.entityId());
+        assertEquals(Base64.getEncoder().encodeToString(signature), encrypted.encryptedValue());
+    }
+
+    @Test
+    void capturesTheSignatureFromTheDroppedTrailingAggregate() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+        byte[] signature = {9, 8, 7};
+
+        List<Event> events = new ArrayList<>();
+        events.addAll(translator.onEvent(thought("plan", true)));
+        // The aggregate repeats the thought and carries the signature; its text is
+        // dropped, but the signature must still be captured and emitted.
+        events.addAll(translator.onEvent(thoughtWithSignature("plan", false, signature)));
+        events.addAll(translator.finish());
+
+        ReasoningEncryptedValueEvent encrypted = (ReasoningEncryptedValueEvent) events.stream()
+                .filter(e -> e.type() == EventType.REASONING_ENCRYPTED_VALUE)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(Base64.getEncoder().encodeToString(signature), encrypted.encryptedValue());
+    }
+
+    @Test
     void snapshotsTheSessionState() {
         AdkEventTranslator translator = new AdkEventTranslator("msg-1");
 
@@ -382,6 +428,18 @@ class AdkEventTranslatorTest {
                 .content(Content.builder()
                         .role("model")
                         .parts(List.of(Part.builder().text(text).thought(true).build()))
+                        .build())
+                .partial(partial)
+                .build();
+    }
+
+    /** A thought part that also carries the model's encrypted reasoning signature. */
+    private static com.google.adk.events.Event thoughtWithSignature(String text, boolean partial, byte[] signature) {
+        return com.google.adk.events.Event.builder()
+                .author("model")
+                .content(Content.builder()
+                        .role("model")
+                        .parts(List.of(Part.builder().text(text).thought(true).thoughtSignature(signature).build()))
                         .build())
                 .partial(partial)
                 .build();

@@ -2,6 +2,7 @@ package com.agui.community.adk.ai;
 
 import com.agui.community.core.event.Event;
 import com.agui.community.core.event.JsonPatchOperation;
+import com.agui.community.core.event.ReasoningEncryptedValueEvent;
 import com.agui.community.core.event.ReasoningEndEvent;
 import com.agui.community.core.event.ReasoningMessageContentEvent;
 import com.agui.community.core.event.ReasoningMessageEndEvent;
@@ -24,6 +25,7 @@ import com.google.genai.types.FunctionCall;
 import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,7 +41,7 @@ import java.util.Set;
  *
  * <pre>
  * thought text     -> REASONING_START, REASONING_MESSAGE_START, REASONING_MESSAGE_CONTENT*,
- *                     REASONING_MESSAGE_END, REASONING_END
+ *                     REASONING_MESSAGE_END, REASONING_ENCRYPTED_VALUE?, REASONING_END
  * text             -> TEXT_MESSAGE_START, TEXT_MESSAGE_CONTENT*, TEXT_MESSAGE_END
  * functionCall     -> TOOL_CALL_START, TOOL_CALL_ARGS, TOOL_CALL_END
  * functionResponse -> TOOL_CALL_RESULT
@@ -56,7 +58,11 @@ import java.util.Set;
  * mapped to the AG-UI reasoning sub-stream (a single reasoning message per turn, with
  * an id distinct from the assistant text so a client keeps them as separate messages)
  * and is deduplicated against the trailing aggregate the same way text is. Switching
- * between reasoning, text and tool calls closes whichever message is open first.
+ * between reasoning, text and tool calls closes whichever message is open first. If a
+ * thought part carries an encrypted {@link Part#thoughtSignature() thought signature},
+ * it is emitted (Base64) as a {@code REASONING_ENCRYPTED_VALUE} bound to the reasoning
+ * message when the reasoning phase closes, so a client can return it to restore the
+ * model's reasoning context.
  *
  * <p><strong>Tools.</strong> When the ADK agent calls one of its (backend) tools,
  * the model's {@code functionCall} is surfaced as {@code TOOL_CALL_START/ARGS/END}
@@ -109,6 +115,10 @@ final class AdkEventTranslator {
     // Whether a partial reasoning delta was emitted this turn. Once true the trailing
     // aggregated (non-partial) thought is dropped so the reasoning is not duplicated.
     private boolean reasoningStreamed;
+    // The model's encrypted thought signature (Base64), captured from thought parts and
+    // emitted as a REASONING_ENCRYPTED_VALUE when the reasoning phase closes, so a
+    // client can return it and let the model restore its reasoning context. Null: none.
+    private String reasoningSignature;
 
     private int toolSeq;
     private int resultSeq;
@@ -145,8 +155,14 @@ final class AdkEventTranslator {
         for (Part part : parts) {
             String text = part.text().orElse("");
             boolean thought = part.thought().orElse(false);
-            if (!text.isEmpty() && thought) {
-                emitReasoning(text, partial, out);
+            if (thought) {
+                // A thought part may carry the model's encrypted reasoning signature;
+                // capture it (latest wins) to emit when the reasoning phase closes.
+                part.thoughtSignature()
+                        .ifPresent(signature -> reasoningSignature = Base64.getEncoder().encodeToString(signature));
+                if (!text.isEmpty()) {
+                    emitReasoning(text, partial, out);
+                }
             } else if (!text.isEmpty()) {
                 closeReasoning(out);
                 emitText(text, partial, out);
@@ -267,6 +283,12 @@ final class AdkEventTranslator {
             reasoningMessageOpen = false;
         }
         if (reasoningPhaseOpen) {
+            // The encrypted value rides its reasoning message: after the message closes,
+            // before the phase ends (subtype "message", bound by the message id).
+            if (reasoningSignature != null) {
+                out.add(new ReasoningEncryptedValueEvent("message", reasoningMessageId, reasoningSignature));
+                reasoningSignature = null;
+            }
             out.add(new ReasoningEndEvent(reasoningMessageId));
             reasoningPhaseOpen = false;
         }

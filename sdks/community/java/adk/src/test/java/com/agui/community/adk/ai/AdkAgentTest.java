@@ -1,14 +1,21 @@
 package com.agui.community.adk.ai;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.agui.community.core.agent.RunAgentInput;
 import com.agui.community.core.event.Event;
 import com.agui.community.core.event.EventType;
 import com.agui.community.core.event.RunErrorEvent;
+import com.agui.community.core.event.RunFinishedEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
 import com.agui.community.core.event.ToolCallStartEvent;
+import com.agui.community.core.interrupt.Interrupt;
+import com.agui.community.core.interrupt.InterruptOutcome;
+import com.agui.community.core.interrupt.Resume;
+import com.agui.community.core.interrupt.ResumeStatus;
 import com.agui.community.core.message.UserMessage;
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
@@ -19,7 +26,9 @@ import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Flowable;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 import org.reactivestreams.FlowAdapters;
@@ -101,10 +110,65 @@ class AdkAgentTest {
         assertEquals(EventType.RUN_FINISHED, events.get(events.size() - 1).type());
     }
 
+    @Test
+    void endsWithAnInterruptOutcomeForALongRunningTool() {
+        BaseAgent agent = fakeAgent(Flowable.just(longRunningCall("call-1", "askUser", Map.of("q", "ok?"))));
+        AdkAgent adkAgent = new AdkAgent(agent);
+        RunAgentInput input = new RunAgentInput("t1", "r1",
+                List.of(new UserMessage("m1", "please confirm")), List.of());
+
+        List<Event> events = collect(adkAgent.run(input));
+
+        // The call is still surfaced for display.
+        assertTrue(events.stream().anyMatch(e -> e.type() == EventType.TOOL_CALL_START));
+
+        RunFinishedEvent finished = (RunFinishedEvent) events.get(events.size() - 1);
+        InterruptOutcome outcome = (InterruptOutcome) finished.outcome();
+        assertEquals(1, outcome.interrupts().size());
+        Interrupt interrupt = outcome.interrupts().get(0);
+        assertEquals("call-1", interrupt.toolCallId());
+        assertEquals("tool_call", interrupt.reason());
+    }
+
+    @Test
+    void resumesALongRunningToolByFeedingItsResultToAdk() {
+        AtomicReference<Content> seen = new AtomicReference<>();
+        BaseAgent agent = capturingAgent(seen, Flowable.just(complete("Done, it is confirmed")));
+        AdkAgent adkAgent = new AdkAgent(agent);
+        // A resume run carries no user message, only the resolved interrupt.
+        RunAgentInput input = new RunAgentInput("t1", "r2", null,
+                List.of(), List.of(), List.of(), null,
+                List.of(new Resume("call-1", ResumeStatus.RESOLVED, Map.of("approved", true))));
+
+        List<Event> events = collect(adkAgent.run(input));
+
+        // ADK was run with a functionResponse for the resolved call.
+        Content content = seen.get();
+        assertNotNull(content);
+        FunctionResponse response = content.parts().orElseThrow().get(0).functionResponse().orElseThrow();
+        assertEquals("call-1", response.id().orElseThrow());
+        assertTrue(response.response().orElseThrow().containsKey("approved"));
+
+        // The continuation streamed and the run finished normally (no interrupt).
+        String text = events.stream()
+                .filter(e -> e instanceof TextMessageContentEvent)
+                .map(e -> ((TextMessageContentEvent) e).delta())
+                .collect(Collectors.joining());
+        assertTrue(text.contains("confirmed"), text);
+        RunFinishedEvent finished = (RunFinishedEvent) events.get(events.size() - 1);
+        assertNull(finished.outcome());
+    }
+
     private static com.google.adk.events.Event functionCall(String id, String name, Map<String, Object> args) {
         return contentEvent(Part.builder()
                 .functionCall(FunctionCall.builder().id(id).name(name).args(args).build())
                 .build());
+    }
+
+    private static com.google.adk.events.Event longRunningCall(String id, String name, Map<String, Object> args) {
+        com.google.adk.events.Event event = functionCall(id, name, args);
+        event.setLongRunningToolIds(Set.of(id));
+        return event;
     }
 
     private static com.google.adk.events.Event functionResponse(String id, Map<String, Object> response) {
@@ -124,6 +188,22 @@ class AdkAgentTest {
         return new BaseAgent("fake_agent", "A fake ADK agent for tests", List.of(), List.of(), List.of()) {
             @Override
             protected Flowable<com.google.adk.events.Event> runAsyncImpl(InvocationContext context) {
+                return events;
+            }
+
+            @Override
+            protected Flowable<com.google.adk.events.Event> runLiveImpl(InvocationContext context) {
+                return Flowable.empty();
+            }
+        };
+    }
+
+    /** A fake agent that records the content it is run with, so resume input can be asserted. */
+    private static BaseAgent capturingAgent(AtomicReference<Content> seen, Flowable<com.google.adk.events.Event> events) {
+        return new BaseAgent("fake_agent", "A fake ADK agent for tests", List.of(), List.of(), List.of()) {
+            @Override
+            protected Flowable<com.google.adk.events.Event> runAsyncImpl(InvocationContext context) {
+                context.userContent().ifPresent(seen::set);
                 return events;
             }
 

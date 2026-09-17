@@ -8,6 +8,7 @@ import com.agui.community.core.event.ToolCallArgsEvent;
 import com.agui.community.core.event.ToolCallEndEvent;
 import com.agui.community.core.event.ToolCallResultEvent;
 import com.agui.community.core.event.ToolCallStartEvent;
+import com.agui.community.core.interrupt.Interrupt;
 import com.agui.community.core.message.Role;
 import com.google.genai.JsonSerializable;
 import com.google.genai.types.FunctionCall;
@@ -16,6 +17,7 @@ import com.google.genai.types.Part;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Translates a stream of Google ADK {@link com.google.adk.events.Event}s into the
@@ -44,6 +46,14 @@ import java.util.Map;
  * Any open text message is closed before tool events are emitted; a text message
  * that resumes afterwards is opened under a fresh id (a client keys messages by id).
  *
+ * <p><strong>Long-running tools.</strong> A call to an ADK
+ * {@link com.google.adk.tools.LongRunningFunctionTool} does not resolve within the
+ * run: ADK marks its id in {@link com.google.adk.events.Event#longRunningToolIds()}.
+ * Such a call is still surfaced as {@code TOOL_CALL_START/ARGS/END}, and in addition
+ * recorded as an {@link Interrupt} (bound by {@code toolCallId}) so the agent can end
+ * the run with an interrupt outcome and let the front end resolve the call. See
+ * {@link #interrupts()}.
+ *
  * <p>An ADK event carrying an {@code errorMessage} aborts the run: the message is
  * thrown so the agent maps it to a terminal {@code RUN_ERROR}.
  */
@@ -66,6 +76,10 @@ final class AdkEventTranslator {
     // without its own id (as when the model omits function-call ids).
     private String lastToolCallId;
 
+    // Long-running tool calls seen in this run, as AG-UI interrupts bound by tool-call
+    // id. The agent reads these after the stream to decide the run's outcome.
+    private final List<Interrupt> interrupts = new ArrayList<>();
+
     AdkEventTranslator(String messageId) {
         this.messageId = messageId;
     }
@@ -85,19 +99,32 @@ final class AdkEventTranslator {
         List<Event> out = new ArrayList<>();
         List<Part> parts = event.content().flatMap(content -> content.parts()).orElse(List.of());
         boolean partial = event.partial().orElse(false);
+        Set<String> longRunning = event.longRunningToolIds().orElse(Set.of());
         for (Part part : parts) {
             String text = part.text().orElse("");
             if (!text.isEmpty()) {
                 emitText(text, partial, out);
             } else if (part.functionCall().isPresent()) {
                 closeText(out);
-                emitFunctionCall(part.functionCall().get(), out);
+                emitFunctionCall(part.functionCall().get(), longRunning, out);
             } else if (part.functionResponse().isPresent()) {
                 closeText(out);
                 emitFunctionResponse(part.functionResponse().get(), out);
             }
         }
         return out;
+    }
+
+    /**
+     * The long-running tool calls observed in this run, as AG-UI {@link Interrupt}s
+     * (each bound by its {@code toolCallId}). Empty when the run had none. The agent
+     * reads this once the stream completes to decide whether the run finished normally
+     * or paused waiting for the front end to resolve these calls.
+     *
+     * @return the interrupts, in the order the calls appeared (never {@code null})
+     */
+    List<Interrupt> interrupts() {
+        return interrupts;
     }
 
     /**
@@ -140,7 +167,7 @@ final class AdkEventTranslator {
         }
     }
 
-    private void emitFunctionCall(FunctionCall call, List<Event> out) {
+    private void emitFunctionCall(FunctionCall call, Set<String> longRunning, List<Event> out) {
         String name = call.name().orElse("");
         String callId = call.id().filter(id -> !id.isEmpty())
                 .orElseGet(() -> messageId + "-tool-" + (++toolSeq));
@@ -149,6 +176,12 @@ final class AdkEventTranslator {
         out.add(new ToolCallStartEvent(callId, name, messageId, null, null));
         out.add(new ToolCallArgsEvent(callId, args));
         out.add(new ToolCallEndEvent(callId));
+        // A long-running tool does not resolve in this run: record it as an interrupt
+        // (bound by the tool-call id) so the run pauses for the front end to resolve it.
+        // ADK marks the call's own id, so only calls the model gave an id can be matched.
+        if (call.id().filter(id -> !id.isEmpty()).map(longRunning::contains).orElse(false)) {
+            interrupts.add(new Interrupt(callId, "tool_call", name, callId, null, null, null));
+        }
     }
 
     private void emitFunctionResponse(FunctionResponse response, List<Event> out) {

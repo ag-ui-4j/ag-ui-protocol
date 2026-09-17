@@ -6,6 +6,10 @@ import com.agui.community.core.event.Event;
 import com.agui.community.core.event.RunErrorEvent;
 import com.agui.community.core.event.RunFinishedEvent;
 import com.agui.community.core.event.RunStartedEvent;
+import com.agui.community.core.interrupt.Interrupt;
+import com.agui.community.core.interrupt.InterruptOutcome;
+import com.agui.community.core.interrupt.Resume;
+import com.agui.community.core.interrupt.ResumeStatus;
 import com.agui.community.core.message.Message;
 import com.agui.community.core.message.Role;
 import com.google.adk.agents.BaseAgent;
@@ -14,10 +18,14 @@ import com.google.adk.runner.InMemoryRunner;
 import com.google.adk.runner.Runner;
 import com.google.adk.sessions.Session;
 import com.google.genai.types.Content;
+import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Single;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -46,6 +54,15 @@ import org.reactivestreams.FlowAdapters;
  * <p>The ADK agent's (backend) tools are run by ADK itself; their calls and results
  * are surfaced as {@code TOOL_CALL_*} / {@code TOOL_CALL_RESULT} events so the front
  * end can display them. See {@link AdkEventTranslator}.
+ *
+ * <p><strong>Human-in-the-loop.</strong> An ADK
+ * {@link com.google.adk.tools.LongRunningFunctionTool} does not resolve within the
+ * run; its call is reported as an AG-UI {@link Interrupt} and the run ends with an
+ * {@link InterruptOutcome} (bound by tool-call id). The front end resolves the call
+ * and starts a new run whose {@link RunAgentInput#resume()} carries the result; the
+ * agent feeds it back to ADK as a {@code functionResponse} on the same thread's
+ * session, and ADK continues from the pending call. A run that resumes ignores the
+ * message history and sends only the function responses.
  *
  * <p>Conversation state lives in the ADK {@link com.google.adk.sessions.Session},
  * keyed by the run's {@code threadId}: the session is created on the first run for a
@@ -186,24 +203,96 @@ public final class AdkAgent implements Agent {
         Objects.requireNonNull(input, "input must not be null");
         String threadId = input.threadId();
         String runId = input.runId();
-        Content userMessage = latestUserContent(input.messages());
+        // A run either resumes pending long-running tool calls (feeding their results
+        // back as function responses) or sends the latest user message. Resuming takes
+        // precedence: the front end has resolved an interrupt from a prior run.
+        Content turnInput = resumeContent(input.resume());
+        if (Objects.isNull(turnInput)) {
+            turnInput = latestUserContent(input.messages());
+        }
+        Content input0 = turnInput;
+        AdkEventTranslator translator = new AdkEventTranslator(messageIdGenerator.get());
 
         Flowable<Event> events = Flowable.<Event>defer(() -> Flowable.concat(
                         Flowable.just(new RunStartedEvent(threadId, runId)),
-                        Objects.isNull(userMessage) ? Flowable.empty() : turn(threadId, userMessage),
-                        Flowable.defer(() -> Flowable.just(new RunFinishedEvent(threadId, runId)))))
+                        Objects.isNull(input0) ? Flowable.empty() : turn(threadId, input0, translator),
+                        Flowable.defer(() -> Flowable.just(finished(threadId, runId, translator)))))
                 .onErrorResumeNext(throwable -> Flowable.just(new RunErrorEvent(describe(throwable))));
 
         return FlowAdapters.toFlowPublisher(events);
     }
 
     /** Streams one model turn: resolve the thread's session, run it, translate the events. */
-    private Flowable<Event> turn(String threadId, Content userMessage) {
-        AdkEventTranslator translator = new AdkEventTranslator(messageIdGenerator.get());
+    private Flowable<Event> turn(String threadId, Content turnInput, AdkEventTranslator translator) {
         return session(threadId)
-                .flatMapPublisher(session -> runner.runAsync(userId, session.id(), userMessage, runConfig))
+                .flatMapPublisher(session -> runner.runAsync(userId, session.id(), turnInput, runConfig))
                 .concatMapIterable(translator::onEvent)
                 .concatWith(Flowable.defer(() -> Flowable.fromIterable(translator.finish())));
+    }
+
+    /**
+     * The event that ends the run: a plain {@code RUN_FINISHED}, or one carrying an
+     * {@link InterruptOutcome} when the model called long-running tools that the front
+     * end must resolve.
+     */
+    private static RunFinishedEvent finished(String threadId, String runId, AdkEventTranslator translator) {
+        List<Interrupt> interrupts = translator.interrupts();
+        if (interrupts.isEmpty()) {
+            return new RunFinishedEvent(threadId, runId);
+        }
+        return new RunFinishedEvent(threadId, runId, new InterruptOutcome(interrupts), null, null, null);
+    }
+
+    /**
+     * Builds the ADK {@link Content} that resumes pending long-running tool calls from
+     * the run input's {@code resume} entries, or {@code null} when there is nothing to
+     * resume. Each resolved entry becomes a {@code functionResponse} keyed by its
+     * interrupt (tool-call) id; ADK matches it to the pending call in the thread's
+     * session and continues. ADK supplies function responses under the {@code user}
+     * role.
+     */
+    private static Content resumeContent(List<Resume> resume) {
+        if (Objects.isNull(resume) || resume.isEmpty()) {
+            return null;
+        }
+        List<Part> parts = new ArrayList<>();
+        for (Resume entry : resume) {
+            String callId = entry.interruptId();
+            if (Objects.isNull(callId) || callId.isEmpty()) {
+                continue;
+            }
+            parts.add(Part.builder()
+                    .functionResponse(FunctionResponse.builder()
+                            .id(callId)
+                            .response(responseMap(entry))
+                            .build())
+                    .build());
+        }
+        return parts.isEmpty() ? null : Content.builder().role("user").parts(parts).build();
+    }
+
+    /**
+     * Coerces a {@link Resume} payload into the map ADK's {@code functionResponse}
+     * expects: a map payload is used as-is, any other value is wrapped under
+     * {@code "output"}, and a cancelled resume reports {@code "cancelled": true}.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> responseMap(Resume entry) {
+        if (entry.status() == ResumeStatus.CANCELLED) {
+            Map<String, Object> cancelled = new LinkedHashMap<>();
+            cancelled.put("cancelled", true);
+            if (Objects.nonNull(entry.payload())) {
+                cancelled.put("output", entry.payload());
+            }
+            return cancelled;
+        }
+        Object payload = entry.payload();
+        if (payload instanceof Map) {
+            return (Map<String, Object>) payload;
+        }
+        Map<String, Object> wrapped = new LinkedHashMap<>();
+        wrapped.put("output", payload);
+        return wrapped;
     }
 
     /** The ADK session for a thread: reuse it if present, otherwise create it. */

@@ -15,7 +15,7 @@ supports) can drive an AG-UI front end.
 
 | Type | Purpose |
 |------|---------|
-| [`AdkAgent`](src/main/java/com/agui/community/adk/ai/AdkAgent.java) | Wraps an ADK agent (via an ADK `Runner`). Sends the latest user message, streams the run's ADK events and emits the AG-UI event lifecycle. |
+| [`AdkAgent`](src/main/java/com/agui/community/adk/ai/AdkAgent.java) | Wraps an ADK agent (via an ADK `Runner`). Sends the latest user message, streams the run's ADK events and emits the AG-UI event lifecycle. Pauses on long-running tool calls and resumes them from `RunAgentInput.resume()`. |
 
 ## Event mapping
 
@@ -30,7 +30,8 @@ RUN_STARTED
     TOOL_CALL_ARGS
   TOOL_CALL_END
   TOOL_CALL_RESULT                    (the tool's result, executed by ADK)
-RUN_FINISHED
+RUN_FINISHED                          (with an InterruptOutcome when a long-running
+                                       tool call is awaiting the front end)
 ```
 
 ADK streams a turn as incremental **partial** events followed by a final aggregated
@@ -48,10 +49,25 @@ result. Each result is its own message (a distinct id, role `tool`), and any ope
 text message is closed before tool events; a text message that resumes afterwards
 opens under a fresh id. Non-text, non-function parts are ignored.
 
-> Client-side / human-in-the-loop tools (advertising `RunAgentInput.tools` to the
-> model and pausing the run for the front end to execute them) are not yet wired up —
-> today the ADK agent executes its tools itself and the calls are surfaced for
-> display.
+**Human-in-the-loop (long-running tools).** ADK models a tool whose result is not
+available within the run as a
+[`LongRunningFunctionTool`](https://google.github.io/adk-docs/tools/function-tools/#3-long-running-function-tool):
+ADK marks its call id in `Event.longRunningToolIds()`. When the model calls one, the
+call is surfaced as `TOOL_CALL_START` / `TOOL_CALL_ARGS` / `TOOL_CALL_END` as usual,
+and the run finishes with an AG-UI **interrupt outcome** — a `RUN_FINISHED` carrying
+an `InterruptOutcome` whose `Interrupt` is bound to the tool call (`reason` is
+`tool_call`, `toolCallId` the call's id). The front end executes the tool, then starts
+a new run for the same `threadId` whose `RunAgentInput.resume()` carries a `Resume`
+(its `interruptId` the tool-call id, its `payload` the result). The agent feeds that
+back to ADK as a `functionResponse` on the thread's session, and ADK continues from
+the pending call. A run that resumes ignores the message history and sends only the
+function responses; a resolved payload that is a map is passed through, any other
+value is wrapped under `output`, and a cancelled resume reports `cancelled: true`.
+
+This is ADK's native HITL mechanism. ADK binds its tool set to the agent at
+construction, so it does not consume the per-run `RunAgentInput.tools` list; front-end
+tools are surfaced through long-running tools registered on the ADK agent rather than
+advertised dynamically per run.
 
 If the ADK stream fails, or an ADK event reports an `errorMessage`, a terminal
 `RUN_ERROR` event is emitted instead of propagating the failure — matching the

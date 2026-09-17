@@ -11,6 +11,7 @@ import com.agui.community.core.event.TextMessageStartEvent;
 import com.agui.community.core.event.ToolCallArgsEvent;
 import com.agui.community.core.event.ToolCallResultEvent;
 import com.agui.community.core.event.ToolCallStartEvent;
+import com.agui.community.core.interrupt.Interrupt;
 import com.agui.community.core.message.Role;
 import com.google.genai.types.Content;
 import com.google.genai.types.FunctionCall;
@@ -19,6 +20,7 @@ import com.google.genai.types.Part;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 
@@ -166,12 +168,48 @@ class AdkEventTranslatorTest {
         assertTrue(start.toolCallId().startsWith("msg-1-tool-"), start.toolCallId());
     }
 
+    @Test
+    void recordsLongRunningToolCallsAsInterrupts() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        List<Event> events = translator.onEvent(longRunningCall("call-1", "askUser", Map.of("q", "ok?")));
+
+        // A long-running call is still surfaced as tool events for display.
+        assertEquals(
+                List.of(EventType.TOOL_CALL_START, EventType.TOOL_CALL_ARGS, EventType.TOOL_CALL_END),
+                events.stream().map(Event::type).toList());
+
+        List<Interrupt> interrupts = translator.interrupts();
+        assertEquals(1, interrupts.size());
+        Interrupt interrupt = interrupts.get(0);
+        assertEquals("call-1", interrupt.id());
+        assertEquals("call-1", interrupt.toolCallId());
+        assertEquals("tool_call", interrupt.reason());
+        assertEquals("askUser", interrupt.message());
+    }
+
+    @Test
+    void doesNotRecordAnInterruptForAnOrdinaryToolCall() {
+        AdkEventTranslator translator = new AdkEventTranslator("msg-1");
+
+        translator.onEvent(functionCall("call-1", "getWeather", Map.of("city", "Paris")));
+
+        assertTrue(translator.interrupts().isEmpty());
+    }
+
     private static com.google.adk.events.Event functionCall(String id, String name, Map<String, Object> args) {
         FunctionCall.Builder call = FunctionCall.builder().name(name).args(args);
         if (id != null) {
             call = call.id(id);
         }
         return contentEvent(Part.builder().functionCall(call.build()).build());
+    }
+
+    private static com.google.adk.events.Event longRunningCall(String id, String name, Map<String, Object> args) {
+        com.google.adk.events.Event event = functionCall(id, name, args);
+        // ADK marks a LongRunningFunctionTool's call id here so the run pauses for it.
+        event.setLongRunningToolIds(Set.of(id));
+        return event;
     }
 
     private static com.google.adk.events.Event functionResponse(String id, Map<String, Object> response) {

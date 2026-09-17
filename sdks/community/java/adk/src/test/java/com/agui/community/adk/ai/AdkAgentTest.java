@@ -8,13 +8,17 @@ import com.agui.community.core.event.Event;
 import com.agui.community.core.event.EventType;
 import com.agui.community.core.event.RunErrorEvent;
 import com.agui.community.core.event.TextMessageContentEvent;
+import com.agui.community.core.event.ToolCallStartEvent;
 import com.agui.community.core.message.UserMessage;
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
 import com.google.genai.types.Content;
+import com.google.genai.types.FunctionCall;
+import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Flowable;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Flow;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
@@ -66,6 +70,54 @@ class AdkAgentTest {
         assertEquals("boom", error.message());
         // A terminal error replaces the run tail — no RUN_FINISHED after it.
         assertTrue(events.stream().noneMatch(e -> e.type() == EventType.RUN_FINISHED));
+    }
+
+    @Test
+    void surfacesToolCallsAndResults() {
+        BaseAgent agent = fakeAgent(Flowable.just(
+                functionCall("call-1", "getWeather", Map.of("city", "Paris")),
+                functionResponse("call-1", Map.of("tempC", 21)),
+                complete("It is 21C in Paris")));
+        AdkAgent adkAgent = new AdkAgent(agent);
+        RunAgentInput input = new RunAgentInput("t1", "r1",
+                List.of(new UserMessage("m1", "weather in Paris?")), List.of());
+
+        List<Event> events = collect(adkAgent.run(input));
+
+        ToolCallStartEvent start = (ToolCallStartEvent) events.stream()
+                .filter(e -> e.type() == EventType.TOOL_CALL_START)
+                .findFirst()
+                .orElseThrow();
+        assertEquals("getWeather", start.toolCallName());
+        assertTrue(events.stream().anyMatch(e -> e.type() == EventType.TOOL_CALL_ARGS));
+        assertTrue(events.stream().anyMatch(e -> e.type() == EventType.TOOL_CALL_END));
+        assertTrue(events.stream().anyMatch(e -> e.type() == EventType.TOOL_CALL_RESULT));
+
+        String text = events.stream()
+                .filter(e -> e instanceof TextMessageContentEvent)
+                .map(e -> ((TextMessageContentEvent) e).delta())
+                .collect(Collectors.joining());
+        assertTrue(text.contains("21C"), text);
+        assertEquals(EventType.RUN_FINISHED, events.get(events.size() - 1).type());
+    }
+
+    private static com.google.adk.events.Event functionCall(String id, String name, Map<String, Object> args) {
+        return contentEvent(Part.builder()
+                .functionCall(FunctionCall.builder().id(id).name(name).args(args).build())
+                .build());
+    }
+
+    private static com.google.adk.events.Event functionResponse(String id, Map<String, Object> response) {
+        return contentEvent(Part.builder()
+                .functionResponse(FunctionResponse.builder().id(id).response(response).build())
+                .build());
+    }
+
+    private static com.google.adk.events.Event contentEvent(Part part) {
+        return com.google.adk.events.Event.builder()
+                .author("model")
+                .content(Content.builder().role("model").parts(List.of(part)).build())
+                .build();
     }
 
     private static BaseAgent fakeAgent(Flowable<com.google.adk.events.Event> events) {

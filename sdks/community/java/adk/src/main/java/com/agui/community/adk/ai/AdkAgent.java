@@ -36,8 +36,16 @@ import org.reactivestreams.FlowAdapters;
  *   TEXT_MESSAGE_START                  (when the agent produces text)
  *     TEXT_MESSAGE_CONTENT*             (streamed as partial deltas)
  *   TEXT_MESSAGE_END
+ *   TOOL_CALL_START                     (per tool the ADK agent calls)
+ *     TOOL_CALL_ARGS
+ *   TOOL_CALL_END
+ *   TOOL_CALL_RESULT                    (the tool's result, executed by ADK)
  * RUN_FINISHED
  * </pre>
+ *
+ * <p>The ADK agent's (backend) tools are run by ADK itself; their calls and results
+ * are surfaced as {@code TOOL_CALL_*} / {@code TOOL_CALL_RESULT} events so the front
+ * end can display them. See {@link AdkEventTranslator}.
  *
  * <p>Conversation state lives in the ADK {@link com.google.adk.sessions.Session},
  * keyed by the run's {@code threadId}: the session is created on the first run for a

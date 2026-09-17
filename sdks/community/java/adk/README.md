@@ -26,6 +26,10 @@ RUN_STARTED
   TEXT_MESSAGE_START                  (when the agent produces text)
     TEXT_MESSAGE_CONTENT*             (streamed as partial deltas)
   TEXT_MESSAGE_END
+  TOOL_CALL_START                     (per tool the ADK agent calls)
+    TOOL_CALL_ARGS
+  TOOL_CALL_END
+  TOOL_CALL_RESULT                    (the tool's result, executed by ADK)
 RUN_FINISHED
 ```
 
@@ -33,8 +37,21 @@ ADK streams a turn as incremental **partial** events followed by a final aggrega
 event that repeats the whole text. Partial chunks are emitted as
 `TEXT_MESSAGE_CONTENT` deltas and the trailing aggregate is dropped, so text is not
 duplicated; when ADK is not streaming, the single complete event's text is emitted
-once. Only text parts are mapped — function calls and other non-text parts are
-ignored. The run uses `RunConfig`'s `StreamingMode.SSE` by default.
+once. The run uses `RunConfig`'s `StreamingMode.SSE` by default.
+
+**Tool calling.** An ADK agent runs its own (backend) tools — the ones registered on
+the agent, e.g. `LlmAgent.builder().tools(...)`. When the model calls one, its
+`functionCall` is surfaced as `TOOL_CALL_START` / `TOOL_CALL_ARGS` (the arguments as
+JSON) / `TOOL_CALL_END`, and the tool's `functionResponse` (which ADK executes
+server-side) as a `TOOL_CALL_RESULT` — so the front end can render the call and its
+result. Each result is its own message (a distinct id, role `tool`), and any open
+text message is closed before tool events; a text message that resumes afterwards
+opens under a fresh id. Non-text, non-function parts are ignored.
+
+> Client-side / human-in-the-loop tools (advertising `RunAgentInput.tools` to the
+> model and pausing the run for the front end to execute them) are not yet wired up —
+> today the ADK agent executes its tools itself and the calls are surfaced for
+> display.
 
 If the ADK stream fails, or an ADK event reports an `errorMessage`, a terminal
 `RUN_ERROR` event is emitted instead of propagating the failure — matching the

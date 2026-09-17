@@ -79,6 +79,7 @@ on:
       # authoritative trigger. Kept in step with release.config.json by
       # verify-release-scope-dropdowns.sh.
       - "sdks/community/java/ag-ui/pom.xml"
+      - "sdks/community/java/adk/pom.xml"
       - "sdks/community/java/spring/spring-ai/pom.xml"
       - "sdks/community/java/spring/spring-boot/pom.xml"
   workflow_dispatch:
@@ -97,6 +98,7 @@ on:
         type: choice
         options:
           - integration-a2a
+          - integration-adk-java
           - integration-adk-py
           - integration-adk-ts
           - integration-ag2
@@ -2018,7 +2020,7 @@ jobs:
               case "$SCOPE" in
                 integration-claude-managed-agents-dotnet|sdk-dotnet)
                   NUGET_INTENDED=true ;;
-                integration-spring-ai-java|integration-spring-boot-java|sdk-java)
+                integration-adk-java|integration-spring-ai-java|integration-spring-boot-java|sdk-java)
                   MAVEN_INTENDED=true ;;
                 integration-agent-spec|integration-langroid|sdk-py-a2ui-toolkit)
                   PY_INTENDED=true ;;
@@ -2105,7 +2107,7 @@ jobs:
                 # this a failed build on a Maven bump reads as "Maven Central was
                 # never intended" and the failure page is swallowed. Kept in step
                 # with release.config.json by verify-release-scope-dropdowns.sh.
-                MAVEN_VERSION_SOURCES="sdks/community/java/ag-ui/pom.xml sdks/community/java/spring/spring-boot/pom.xml sdks/community/java/spring/spring-ai/pom.xml"
+                MAVEN_VERSION_SOURCES="sdks/community/java/ag-ui/pom.xml sdks/community/java/adk/pom.xml sdks/community/java/spring/spring-boot/pom.xml sdks/community/java/spring/spring-ai/pom.xml"
                 for pom in $MAVEN_VERSION_SOURCES; do
                   if printf '%s\n' "$FILES" | grep -qxF "$pom"; then
                     MAVEN_INTENDED=true

@@ -84,6 +84,14 @@
         { "name": "ag-ui-spring-ai-webmvc-boot-starter", "path": "sdks/community/java/spring/spring-ai/spring-ai-webmvc-boot-starter", "ecosystem": "maven", "groupId": "com.ag-ui.community" }
       ]
     },
+    "integration-adk-java": {
+      "description": "Google ADK integration for the Java SDK (community, Maven Central — stable releases only; Maven Central has no canary channel)",
+      "sharedVersion": true,
+      "versionSource": "sdks/community/java/adk/pom.xml",
+      "packages": [
+        { "name": "ag-ui-adk", "path": "sdks/community/java/adk", "ecosystem": "maven", "groupId": "com.ag-ui.community" }
+      ]
+    },
     "integration-a2a": {
       "description": "A2A integration (TypeScript)",
       "sharedVersion": false,
